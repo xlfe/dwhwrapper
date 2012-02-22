@@ -1,0 +1,20 @@
+Metadata-Version: 1.1
+Name: dwhwrapper
+Version: 1.0a
+Summary: cli wrapper for Teradata data warehouse utilities (BTEQ,etc..)
+Home-page: https://github.com/xlfe/dwhwrapper
+Author: Felix Barbalet
+Author-email: felixb@gmail.com
+License: GNU General Public License version 3 (GPLv3)
+Description: cli wrapper for Teradata data warehouse utilities (BTEQ,etc..)
+Keywords: teradata bteq fastexport multiload csv sql
+Platform: linux-x86
+Classifier: Development Status :: 3 - Alpha
+Classifier: License :: OSI Approved :: GNU General Public License (GPL)
+Classifier: Environment :: Console
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Programming Language :: Python :: 2.6
+Classifier: Topic :: Database :: Front-Ends
+Classifier: Topic :: Utilities
+Requires: python (==2.6)
+Requires: cliv2

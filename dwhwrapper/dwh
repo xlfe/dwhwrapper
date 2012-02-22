@@ -1,0 +1,718 @@
+#!/usr/bin/env python
+#
+# 	 dwhwrapper - cli wrapper for Teradata data warehouse utilities (BTEQ,etc..)
+#    Copyright (C) 2012 Felix Barbalet, Corporate Analytics, Australian Taxation Office, Commonwealth of Australia
+#	 
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#    dwh - main interface
+#
+#    provides a command line interface to teradata bteq and fexp utilities to:
+# 	 dwh 		: easy execution of scripts/SQL queries from the command line
+# 	 dwhget		: download to csv without third-party conversion tools
+# 	 dwhput		: upload from csv without third-party conversion tools
+# 	 dwhtable	: scan csv file to determine appropriate CREATE TABLE statement
+#
+version = "dwh wrapper script - v1.0a"
+
+import sys
+import os
+import math
+import argparse
+import subprocess
+import ConfigParser
+import string
+import stat
+import datetime
+import struct
+import json
+import csv
+import getpass
+import re
+import atexit
+import collections
+
+from tdcli import get_ddf, csv_to_fexp, fexp_to_csv
+
+global procs
+
+def parse_args():
+	"""Defines and parses arguments from the command line
+	- we try to do some intelligent handling of options here
+	- for example, ./dwhget and './dwh get' and './dwh download'
+	- all call the same subcode
+	"""
+	
+	global_args = argparse.ArgumentParser(add_help=False)	
+	global_args.add_argument('-d','--dbc',	metavar='dwh',	action='store',		help='dbc name to use, read from ~/.odbc.ini')
+	global_args.add_argument('-l','--log',	metavar='file',	action='store', 	help='log messages to file')
+	global_args.add_argument('-q','--quiet',				action='store_true',help='suppress output from teradata utilities')
+	global_args.add_argument('-v','--verbose',				action='store_true',help='enable verbose messages')
+	
+	if len(sys.argv) > 1:
+		subcommand = sys.argv[1]
+		if subcommand in ['get','download','put','upload','table','execute']:
+			sys.argv[0] = '{0} {1}'.format(sys.argv[0],sys.argv[1])
+			sys.argv.pop(1)
+	else:
+		subcommand = ''
+	
+	if sys.argv[0][-6:] == 'dwhget' or subcommand in ['get','download']:
+		commands = argparse.ArgumentParser(description="download data to a csv file using bteq or fastexp",epilog=version,parents=[global_args])
+		commands.add_argument('--fexp',action='store_true',help="use fastexp instead of bteq")
+		commands.add_argument('--sessions',metavar='S', type=int, action='store',default=20, help='Concurrent sessions in fexp mode - default is 20')
+		commands.add_argument('--use-column-titles',action='store_true',help="use column titles instead of column names in headings")
+		commands.add_argument('--binary',action='store_true',help="save binary data (don't convert to csv)")
+		commands.add_argument('output',		metavar='output.csv',	help='output csv file')
+		commands.add_argument('sql',metavar='SQL',help='sql query or script file (or - for stdin)')
+	
+	elif sys.argv[0][-6:] == 'dwhput' or subcommand in ['put','upload']:
+		commands = argparse.ArgumentParser(description="upload data from a csv file",epilog=version,parents=[global_args])
+		
+		meg = commands.add_mutually_exclusive_group()
+		meg.add_argument('--fastload',action='store_true',help="use fastload instead of bteq")
+		meg.add_argument('--multiload',action='store_true',help="use multiload instead of bteq")
+		
+		commands.add_argument('--sessions',		metavar='S', type=int, 	action='store',default=20, help='concurrent sessions in fast/multi-load mode')
+		commands.add_argument('--use-column-titles',					action='store_true', help="use column titles instead of column names in headings")
+		commands.add_argument('--pack',type=int,metavar='P',default=50,	 help='number of rows to pack together for upload (bteq only)')
+		commands.add_argument('--binary',action='store_true',help="read binary data instead of csv")
+		commands.add_argument('dest',			metavar='database.table',help='destination: column names must match csv headers')
+		commands.add_argument('input',			metavar='input.csv'		,help='input csv file')
+	
+	elif sys.argv[0][-8:] == 'dwhtable' or subcommand in ['table']:
+		commands = argparse.ArgumentParser(description="output a CREATE TABLE statement using detected column types from a csv file",epilog=version)
+		commands.add_argument('new_input', metavar='input.csv',help='input csv file')
+		commands.add_argument('--maxrows',metavar='MAXROWS',help='maximum rows to scan',default=10000,type=int)
+
+	else:
+		commands = argparse.ArgumentParser(epilog=version,description="execute a sql query or script",parents=[global_args])
+		commands.add_argument('sql',metavar='SQL',help='sql query or script file (or - for stdin)')
+		
+	return commands.parse_args()
+
+def isgoreadable(filepath):
+	try:
+		st = os.stat(filepath)
+	except OSError:
+		return False
+	
+	group = bool(st.st_mode & stat.S_IRGRP) 
+	other = bool(st.st_mode & stat.S_IROTH)
+	if group is True or other is True:
+		return True
+	else:
+		return False
+
+def read_odbcini(dbcname,homedir):
+	"""retreives dbc/user/logon info from ~/.odbc.ini file"""
+	
+	cfg = {}
+	
+	config = ConfigParser.RawConfigParser()
+	config.read(os.path.join(homedir,'.odbc.ini'))
+	sections = config.sections()
+	
+	if len(sections) == 0:
+		raise Exception('Error, no config sections found in ~/.odbc.ini')
+		
+	#default dbcname is dwh32
+	if dbcname is None:
+		dbcname = 'DWH32'
+
+	#also do a case insensitive search - finds the first one
+	if dbcname not in sections:
+		for s in sections:
+			if s.lower() == dbcname.lower():
+				dbcname = s
+		
+	if dbcname not in sections:
+		raise Exception("'{0}' not found in ~/.odbc.ini - please specify one of [{1}]".format(dbcname,''.join('\'{0}\''.format(s) for s in sections)))
+	
+	for i in config.items(dbcname):
+		cfg[i[0].lower()] = i[1].lower()
+	
+	info = {}
+	for var in ['password','username','dbcname']:
+		info[var] = None
+		if var in cfg:
+			if len(cfg[var]) > 0:
+				info[var] = cfg[var]
+			
+
+	return info['dbcname'],info['username'],info['password']
+
+def getTerminalSize():
+    def ioctl_GWINSZ(fd):
+        try:
+            import fcntl, termios 
+            cr = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ,'1234'))
+        except:
+            return None
+        return cr
+    cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
+    if not cr:
+        try:
+            fd = os.open(os.ctermid(), os.O_RDONLY)
+            cr = ioctl_GWINSZ(fd)
+            os.close(fd)
+        except:
+            pass
+    if not cr:
+        try:
+            cr = (env['LINES'], env['COLUMNS'])
+        except:
+            cr = (25, 80)
+    return int(cr[1]), int(cr[0])
+
+
+def check_for_old_logon_files(homedir):
+	"""checks if .bteq.logon still exists and prints a warning"""
+
+	for f in ['.bteq.logon','.odbc.ini','dwh.pwd']:
+		if isgoreadable('{0}/{1}'.format(homedir,f)):
+			raise Exception("""
+				
+				Fatal error	
+							
+				{0} has the wrong permissions set.
+				This might mean other users can read your dwh password.
+				
+				Please run the following command at the prompt to correct this:
+				$ chmod 600 {0}
+				
+				""".format(os.path.join(homedir,f)))
+	
+	if os.path.exists('{0}/.bteq.logon'.format(homedir)):
+		print '### WARNING ~/.bteq.logon is now deprecated.'
+		print '### delete .bteq.logon from your home directory to avoid this warning.'
+
+def now_ts():
+	"""return current timestamp string"""
+	return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+def exec_cmd(args,cmd,script):
+	"""run a bteq/fexp instance using arg options to run commands"""
+	
+	global procs
+	print '--- executing {1} at {0}'.format(now_ts(),cmd)
+	#open a connection to BTEQ	
+	proc = subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+	
+	procs.append(proc)
+	
+	dt0 = datetime.datetime.now()
+	(stdout,stderr) = proc.communicate(script)
+	dt1 = datetime.datetime.now()
+	
+	procs.pop()
+	
+	print '--- {1} execution completed. elapsed time: {0}'.format((dt1-dt0),cmd)
+	
+	if args.verbose is True:
+		print stdout
+	
+	return stdout,stderr
+
+def cleanup():
+	"""make sure we stop any child processes"""
+	global procs
+	
+	for p in procs:
+		p.kill()
+	
+	close_log()
+	
+atexit.register(cleanup)
+				
+def bteq_script(args,commands):
+	
+	stdout,stderr = exec_cmd(args,'bteq',commands)
+	
+	for l in stderr.split('\n'):
+		
+		if len(l.strip()) == 0:
+			continue
+		
+		if l[:14] == " *** Warning: ":
+			continue
+		elif l[:22] == " *** Growing Buffer to":
+			continue		
+		elif l[:14] == "              ":
+			continue
+		
+		print stderr
+		raise Exception('###Error: {0}'.format(l))
+		
+	if args.verbose is False and 'output' not in args and 'input' not in args:
+		
+		sql_cmd = False
+		
+		for l in stdout.split('\n'):
+			
+			if len(l.strip()) ==0 and sql_cmd is False:
+				continue
+			
+			if sql_cmd is False:
+				if l in commands and l[0] != ".":
+					
+					sql_cmd=True
+					ln =''
+					for i in range(0,getTerminalSize()[0]):
+						ln='{0}-'.format(ln)
+					print ln
+					print ''
+					print l
+			else:
+				if l[:11] == "+---------+":
+					sql_cmd = False
+					ln =''
+					for i in range(0,getTerminalSize()[0]/2):
+						ln='{0}- '.format(ln)
+					print ln
+				else:
+					print l
+			
+	return stdout,stderr
+
+def parse_query(query,single_query,remove_newlines):
+	"""take the SQL option from the command line and return the sql"""
+	
+	if query == '-':
+		query = sys.stdin.read()
+	else:
+		try:
+			query = open(query,'r').read()
+		except:
+			if ' ' in query:
+				pass
+			else:
+				raise
+	
+	if remove_newlines is True:
+		query = re.sub('(--[^\r\n]*)',' ',query)
+		query = re.sub('/\*[\w\W]*?(?=\*/)\*/',' ',query)
+		query = re.sub('[\r\n]+',' ',query)
+		query = re.sub(' [\s]+',' ',query)
+
+	if single_query is True:
+		q = '{0};'.format(query.split(';')[0])
+		
+	else:
+		q=[]		
+		for qs in query.split('\n'):
+			if len(qs.strip())> 0:
+				q.append(qs.strip())
+			
+	return q
+
+class csv_column():
+	
+	def __init__(self,col_name):
+		self.types = collections.defaultdict(int)
+		self.min_length=65536
+		self.max_length=0
+		self.prec = 0
+		self.scale = 0
+		self.Name = col_name
+		
+	def insert_cell(self,cell):
+		
+		type = self.detect_cell_type(cell)
+		self.types[type] = self.types[type] + 1
+		if type is not 'EMPTY':
+			self.min_length = min(self.min_length,len(cell))
+			self.max_length = max(self.max_length,len(cell))
+		
+		#print '{0} {1}'.format(type,cell)
+		
+	def detect_cell_type(self,cell):
+		
+		if cell is None or len(cell) == 0:
+			return 'EMPTY'
+		
+		map = [		('INT'		,'[-+]?[0-9]{1,9}')
+			   ,	('DECIMAL'	,'[-+]?([0-9]{10,18})()')
+			   ,	('DECIMAL'	,'[-+]?([0-9]*)\.([0-9]+)')
+			   ,	('FLOAT'	,'[-+]?[0-9]*\.?[0-9]+[eE][-+]?[0-9]+')
+			   ,	("DATE FORMAT 'YYYY-MM-DD'",'[0-9]{2,4}[-|/][0-9]{1,2}[-|/][0-9]{1,2}')
+		]
+		
+		for k,v in map:
+			m =re.match('^[\s]*{0}[\s]*$'.format(v),cell) 
+			if m is not None:
+				if k == 'DECIMAL':
+					self.prec =  max(self.prec,len(m.group(1)) + len(m.group(2)))
+					self.scale = max(self.scale,len(m.group(2)))
+					
+				return k
+			
+		return 'CHAR'
+			
+
+class csv_detection():
+	
+	def __init__(self,file):
+		self.csv = csv.DictReader(open(file,'r'))
+		
+	def scan(self,maxrows):
+		
+		columns = []
+		rows=0
+		
+		for f in self.csv.fieldnames:
+			columns.append(csv_column(f))
+
+		for r in self.csv:
+			if rows > maxrows:
+				print '--only first {0} rows scanned'.format(maxrows)
+				break
+			
+			rows=rows+1
+			
+			for c in columns:
+				c.insert_cell(r[c.Name])
+		
+		#value heirachy
+		# char
+		# float
+		# decimal
+		# int
+		# date
+		types=[]
+		null= False
+		for c in columns:
+			
+			s= sorted(c.types.iteritems(),key=lambda k:k[1],reverse=True)
+			type = s[0][0]
+			
+			if len(c.types) > 1 :
+				
+				if type == 'EMPTY':
+					type = s[1][0]
+				
+				other_types = [t for t in c.types.iterkeys() if t is not type]
+				
+				for o in other_types:
+					if o == 'EMPTY':
+						null=True
+					elif type =='INT' and o in ['DECIMAL','FLOAT']:
+						if 'FLOAT' in other_types:
+							type = 'FLOAT'
+						else:
+							type = 'DECIMAL'
+				
+				if 'CHAR' in other_types:
+					type = 'CHAR'
+					
+				if null is False or len(other_types) > 1:
+					others = ','.join('{0} {1:.0%}'.format(k[0],float(k[1])/rows) for k in s if k[0] is not 'EMPTY')
+					print '--ambiguous col {0} set as {2} [{1}]'.format(c.Name,others,type)
+				
+			if type =='DECIMAL':
+				prec = max(c.prec-c.scale,c.max_length+c.scale)
+				type = 'DECIMAL({0},{1})'.format(prec,c.scale)
+			elif type=='EMPTY':
+				type = 'BYTEINT DEFAULT NULL'
+			elif type == 'CHAR' or type =='UNKNOWN':
+				if c.max_length==c.min_length:
+					type = 'CHAR({0})'.format(c.max_length)
+				else:
+					type = 'VARCHAR({0})'.format(c.max_length)
+			elif type =='INT':
+				if c.max_length < 5:
+					type = 'SMALLINT'
+			
+			types.append('{0} {1}'.format(c.Name,type))
+			
+		print 'CREATE TABLE <INSERTNAME> ('	
+		print '\n,'.join(t for t in types)
+		print ');'
+
+			
+
+def detect_csv_columns(args):
+	
+	csvd = csv_detection(args.new_input)
+	
+	csvd.scan(args.maxrows)
+	
+	
+def open_log(log):
+	"""redirect stdout/stderr to logfile"""
+	logfile = open(log,'a')
+	sys.stdout = logfile
+	sys.stderr = logfile
+
+def close_log():
+	if sys.stdout != sys.__stdout__:
+		try:
+			sys.stdout.close()
+		except:
+			pass
+	sys.stdout = sys.__stdout__
+	sys.stderr = sys.__stderr__
+
+def main():
+	global procs #used to ensure any child processes are killed upon exit
+	procs =[]
+		
+	args = parse_args()
+	
+	
+	if 'new_input' in args:
+		detect_csv_columns(args)
+		exit()
+		
+	if args.log is not None:
+		open_log(args.log)
+		
+	if args.verbose is True:
+		print args
+		
+	homedir = os.path.expanduser('~')
+	check_for_old_logon_files(homedir)
+		
+		
+	try:
+		dbc,uid,pw = None,None,None
+		dbc,uid,pw = read_odbcini(args.dbc,homedir)
+	except Exception as e:
+		print '### {0}'.format(e)
+		print '### Unable to obtain DBC config/logon details from ~/.odbc.ini'	
+		
+	if dbc is None:
+		print '### Using default dbc connection'
+		dbc = 'dbc'
+		
+	if uid is None:
+		uid = getpass.getuser()
+		print '### Using userid: {0}'.format(uid)
+		
+	if pw is None:
+		pw = getpass.getpass(prompt='Please enter your DWH password:')
+		
+		if len(pw) ==0:
+			raise Exception('No password entered')
+		
+	commands = []
+		
+	if 'output' in args:								#download
+		
+		if os.path.exists(args.output):
+				raise Exception("Error '{0}' exists - please specify another output file".format(args.output))
+		
+		raw_file = '{0}.raw'.format(args.output)
+		
+		if os.path.exists(raw_file) is True:
+			print "Warning: deleting stale binary file '{0}'".format(raw_file)
+			os.remove(raw_file)
+		
+		sql = parse_query(args.sql,single_query=True,remove_newlines=True)
+		ddf = get_ddf(sql,dbc,uid,pw,args)
+		
+		if args.fexp is True: #fastexport
+				
+				for c in \
+						[   '.LOGTABLE PUSERTEMP.fexp_log;'
+						,	'.LOGON {0}/{1},{2};'.format(dbc,uid,pw)
+						,	'.BEGIN EXPORT SESSIONS {0};'.format(args.sessions)
+						,	'.EXPORT OUTFILE \'{0}\' MODE INDICATOR FORMAT FASTLOAD;'.format(raw_file)
+						,	 sql
+						,	'.END EXPORT;'
+						,	'.LOGOFF;'
+							]:
+					commands.append(c)
+					
+				stdout,stderr = exec_cmd(args,'fexp',"".join('{0}\n'.format(c) for c in commands))
+				
+				if re.search('UTY8722',stdout) is None:
+					print stderr
+					raise Exception()
+				
+		else:											#bteq
+			
+			for c in [		'.LOGON {0}/{1},{2};'.format(dbc,uid,pw)
+						,	'.EXPORT INDICDATA FILE=\'{0}\';'.format(raw_file)
+						,	sql  
+						,	'.EXPORT RESET;'
+						,	'.LOGOFF;'
+						]:
+				commands.append(c)
+				
+			stdout,stderr = bteq_script(args,"".join('{0}\n'.format(c) for c in commands))
+		
+		if args.binary is True:
+			print '--- binary output written to {0}'.format(raw_file)
+		else:
+			fexp_to_csv(ddf['ddf'],raw_file,args)
+			os.remove(raw_file)
+			print '--- csv output written to {0}'.format(args.output)
+			
+
+	elif 'input' in args:
+				
+		try:
+			tbl = re.compile('^[^a-z0-9\.\_]*([a-z0-9\.\_]+)').match(args.dest.lower()).group(1)
+		except:
+			raise Exception('Unable to parse table name {0}'.format(args.dest))
+		
+		ddf = get_ddf('SELECT * FROM {0};'.format(tbl),dbc,uid,pw,args)
+		
+		if args.binary is True:
+			fields = ddf['ddf']
+			fexp_file = args.input
+		else:
+			fexp_file = '{0}.fexp'.format(args.input)
+			fields = csv_to_fexp(ddf['ddf'],args.input,fexp_file,args)
+			
+		types = []
+		
+		for f in fields:
+			if f['Type'] in ['CHAR','VARCHAR']:
+				f['Types']='{0}({1})'.format(f['Type'],f['Len'])
+			elif f['Type'] in ['DECIMAL']:
+				f['Types']='DECIMAL({0},{1})'.format(f['Len'][0],f['Len'][1])
+			else:
+				f['Types']=f['Type']
+		
+		if args.fastload is True:
+			
+			for c in [		'.SESSIONS {0};'.format(args.sessions)
+						,	'.LOGON {0}/{1},{2};'.format(dbc,uid,pw)
+						,	'.DEFINE {1} FILE = {0};'.format(fexp_file,','.join('{0} ({1})'.format(f['Name'],f['Types']) for f in fields))
+						,	'.BEGIN LOADING {0} ERRORFILES {0}Err1, {0}Err2 CHECKPOINT 10000 INDICATORS ;'.format(tbl)
+						,	'INSERT INTO {0} (:{1});'.format(tbl,
+							',:'.join(f['Name'] for f in fields))
+						,	'.END LOADING;'
+						,	'.LOGOFF;'
+						]:
+					commands.append(c)
+				
+			stdout,stderr = exec_cmd(args,'fastload',"".join('{0}\n'.format(c) for c in commands))
+			
+			res_search = {'Total':'Total Records Read'
+						  ,'Error1':'Total Error Table 1'
+						  ,'Error2':'Total Error Table 2'
+						  ,'Inserts':'Total Inserts Applied'
+						  ,'Duplicates':'Total Duplicate Rows'}
+			
+			res_results={}
+			for k in res_search:
+				
+				r = re.search('{0}[\s]+=[\s]*([0-9]+)'.format(res_search[k]),stdout)
+				if r is None:
+					res_results[k]=None
+				else:
+					res_results[k]=r.group(1)
+					
+				
+			if res_results['Total'] is None:
+				err = re.search('RDBMS error ([^=]+)',stdout)
+				
+				if err is not None:
+					for g in err.groups():
+						print stdout
+						raise Exception(re.sub('[\s\r\n]+',' ',g))
+				else:
+					print stdout
+					raise Exception()
+			else:
+				print '{0} records read, {1} inserts applied with {2} duplicates'.format(res_results['Total'],res_results['Inserts'],res_results['Duplicates'])
+			
+			if args.binary is False:	
+				os.remove(fexp_file)
+		
+		elif args.multiload is True:
+			
+			for c in [		'.LOGTABLE {0}lt0;'.format(tbl)	
+						,	'.LOGON {0}/{1},{2};'.format(dbc,uid,pw)
+						,	'.BEGIN IMPORT MLOAD TABLES {0};'.format(tbl)
+						# ERRORFILES {0}Err1, {0}Err2 CHECKPOINT 10000 INDICATORS
+						,	'.LAYOUT FILEIN;'
+						,	'.FIELD {0};'.format('.FIELD '.join('{0} * {1};\n'.format(f['Name'],f['Types']) for f in fields))
+						,	'.DML LABEL INSERTS;'
+						,	'INSERT INTO {0} ({1})'.format(tbl,','.join(f['Name'] for f in fields))
+						,	'VALUES (:{0});'.format(',:'.join(f['Name'] for f in fields))
+						,	'.IMPORT INFILE {0} FORMAT FASTLOAD LAYOUT FILEIN APPLY INSERTS;'.format(fexp_file)
+						,	'.END MLOAD;'
+						,	'.LOGOFF;'
+						]:
+					commands.append(c)
+				
+			stdout,stderr = exec_cmd(args,'mload',"".join('{0}\n'.format(c) for c in commands))
+			
+			print stdout
+			print stderr
+			
+			if args.binary is False:
+				os.remove(fexp_file)
+			
+			
+		else:
+			
+			for c in [		'.LOGON {0}/{1},{2};'.format(dbc,uid,pw)
+						,	'.SET INDICDATA ON;'
+						,	'.SET SESSIONS 10;'
+						,	'.IMPORT INDICDATA FILE = \'{0}\';'.format(fexp_file)					
+						,	'.REPEAT * PACK {0};'.format(args.pack)
+						,	'.QUIET ON;'
+						,	'USING ({1})\n\tINSERT INTO {0} ({2})\n\t VALUES (:{3});'.format(tbl,
+							','.join('{0} {1}'.format(f['Name'],f['Types']) for f in fields),
+							', '.join(f['Name'] for f in fields),',:'.join(f['Name'] for f in fields))
+						,	'.LOGOFF;'
+						]:
+				commands.append(c)
+			
+			stdout,stderr = bteq_script(args,"".join('{0}\n'.format(c) for c in commands))
+			if args.binary is False:
+				os.remove(fexp_file)
+			
+			for l in stdout.split('\n'):
+				m = re.match(' \*\*\* Total number of statements: ([0-9]+),  Accepted : ([0-9]+),  Rejected : ([0-9]+)',l)
+				if m is not None:
+					if int(m.group(3)) > 0:
+						print stdout
+						print stderr
+						raise Exception('{0} of {1} rows rejected'.format(m.group(1),m.group(3)))
+					else:
+						print '--- {0} rows inserted into {1}'.format(m.group(1),tbl)
+			
+	else:								#execute
+		
+		commands.append('.LOGON {0}/{1},{2};'.format(dbc,uid,pw))
+		commands.append('.SET WIDTH {0};'.format(getTerminalSize()[0]))
+		for c in parse_query(args.sql,single_query=False,remove_newlines=False):
+			commands.append(c)
+			
+		stdout,stderr = bteq_script(args,"".join('{0}\n'.format(c) for c in commands))
+		
+	if args.log is not None:
+		close_log()
+		
+	return 0
+
+if __name__ == '__main__':
+	try:
+		main()
+	except Exception as e:
+		print 'Exception: {0}'.format(e)
+		close_log()
+		raise
+	
+
+
+	
+	

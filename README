@@ -1,0 +1,161 @@
+# 	 dwhwrapper - cli wrapper for Teradata data warehouse utilities (BTEQ,etc..)
+#    Copyright (C) 2012 Felix Barbalet, Corporate Analytics, Australian Taxation Office, Commonwealth of Australia
+#	 
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+dwh wrapper - a data warehouse wrapper script for use with Teradata utilities
+
+provides a cli to teradata bteq and other utilities to allow:
+* easy execution of scripts/SQL queries from the command line
+* download to csv (and binary) format without third-party conversion tools
+* upload from csv (and binary) format without third-party conversion tools
+
+website: https://github.com/xlfe/dwhwrapper
+Copyright 2012 Felix Barbalet, Corporate Analytics, Australian Taxation Office, Commonwealth of Australia
+Released under the GPL (v3)
+Copyright retained by Corporate Analytics, Australian Taxation Office, Commonwealth of Australia
+
+Requires: python 2.6, Teradata linux_cliv2, Teradata BTEQ
+Optional: Teradata fastexp, fastld and mload
+
+Tested using Teradata utilities version 13
+
+--------------------------------------------------------------------------------
+Installation (Linux)
+
+Make sure you have the Teradata linux cliv2 and bteq installed.
+
+1. unzip the archive
+
+2. run the install command: 
+
+system-wide:
+$ sudo python setup.py install
+
+user-only:
+$ python setyp.py install --user
+
+--------------------------------------------------------------------------------
+Logon credentials
+
+Default credentials are read from '~/.odbc.ini'. For example, your ~/.odbc.ini
+might contain the following:
+
+    [dwh32]
+    DBCName=dbc
+    Username=USERID
+    Password=PASSWORD
+
+
+By default, the script looks for a section called 'DWH32' and takes the dbcname,
+username and password from there and uses those details to connect to the
+Teradata machine.
+
+You can specify another section from your ~/.odbc.ini to use with the -d or --dbc
+command line options. If ~/.odbc.ini is not found, the default 'dbc' is used and
+your current username is used, and you will be prompted for your dbc password.
+
+
+--------------------------------------------------------------------------------
+Usage
+
+The default mode is script/query execution mode. For example:
+
+
+$ dwh 'select current_time'
+
+    dwh 'select current_date'
+    --- executing bteq at 2012-02-14 12:10:58
+    --- bteq execution completed. elapsed time: 0:00:01.862359
+    ----------------------------------------------------------------------------
+    
+    select current_date
+    
+     *** Query completed. One row found. One column returned. 
+     *** Total elapsed time was 1 second.
+    
+        Date
+    --------
+    12/02/14
+    
+     *** BTEQ exiting due to EOF on stdin.
+    
+     *** Exiting BTEQ...
+     *** RC (return code) = 0 
+
+
+You can specify a script to execute instead:
+
+$ dwh script.sql
+
+Which will read 'script.sql' and execute the entire contents against the dbc
+
+
+
+
+The second use mode is download, or 'get' mode:
+
+$ dwh get output.csv 'select * from MYDB.MYTABLE'
+
+This will download the returned rows from the sql statement in binary bteq format
+and convert it to csv, saving the output in 'output.csv'
+
+$ dwh get -h
+    will list the available options to use with the get/download command.
+
+
+
+The third use mode is upload, or 'put' mode:
+
+$ dwh put MYDB.MYTABLE input.csv
+
+This will read the csv file 'input.csv' and convert the contents to Teradata
+binary format based on the column definitions from MYDB.MYTABLE. Note that for
+every column header in the csv file there must be a corresponding column in
+MYDB.MYTABLE.
+
+$ dwh put -h
+    will list the available options to use with the put/upload command
+
+
+
+
+The fourth use mode is table mode:
+
+$ dwh table input.csv
+
+This is an experimental mode (and probably has more bugs than the other modes)
+which will scan input.csv and generate a CREATE TABLE sql statement - useful if
+you want to upload a csv file, but don't have a table created already on the
+warehouse - the script attempts to guess the correct definitions and data types
+for each csv column - you are advised to check that they make sense!
+
+
+
+--------------------------------------------------------------------------------
+
+Warnings
+
+* This script is in BETA currently - it probably contains bugs, and you should
+  check that any data you upload or download from your dbc has been converted
+  correctly
+  
+* Upon running setup.py install, a python file is generated <dbcarea.py> which
+  serves as the interface between the dbcwrapper and the Teradata cliv2 library.
+  This is architecture dependent, and our testing has been done on a 64bit intel
+  system. Users on other architectures want to beware (we have not tested other
+  architectures).
+  
+* We assume we're working with LATIN character set ISO8859-1
