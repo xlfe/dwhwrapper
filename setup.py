@@ -159,7 +159,7 @@ description = "cli wrapper for Teradata data warehouse utilities (BTEQ,etc..)"
 
 s = setup(
 	name = "dwhwrapper",
-	version = "1.0a",
+	version = "1.01a",
 	author = "Felix Barbalet",
 	author_email = "felixb@gmail.com",
 	description = description,

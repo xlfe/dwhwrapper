@@ -25,7 +25,7 @@
 # 	 dwhput		: upload from csv without third-party conversion tools
 # 	 dwhtable	: scan csv file to determine appropriate CREATE TABLE statement
 #
-version = "dwh wrapper script - v1.0a"
+version = "dwh wrapper script - v1.01a"
 
 import sys
 import os

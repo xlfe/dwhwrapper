@@ -496,11 +496,11 @@ class type_char(td_type):
 		if len(r) > self.fd['Len']:
 			raise ValueError("Column '{0}' contains a string longer than {1} characters".format(d['Name'],d['Len']))
 			
-		rph.add_data(self,r)
+		rph.add_data(self,r.ljust(self.fd['Len']))
 	
 	def unpack(self,row_data,offset):
 		
-		row_item = row_data[offset : offset + self.data_length].rstrip('\0')
+		row_item = row_data[offset : offset + self.data_length]
 		return row_item,self.data_length
 
 class type_decimal(td_type):

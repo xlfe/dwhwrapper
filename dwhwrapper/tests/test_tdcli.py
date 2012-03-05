@@ -207,7 +207,7 @@ class TestTDTypes(unittest.TestCase):
 	def gen_char(self):
 		
 		length = random.randint(0,64000)
-		string = ISO8859(length-random.randint(0,length))
+		string = ISO8859(length-random.randint(0,length)).ljust(length)
 		
 		ddf = self.dummy_ddf('CHAR',length)
 		
